@@ -60,14 +60,14 @@ flowchart LR
     GW <-->|"Review"| CM
     GW <-->|"Read"| RP
 
-    FA --- FA_DB[("Assessment DB")]
-    PF --- PF_DB[("Payment DB")]
-    ATO --- ATO_DB[("ATO DB")]
-    ML --- ML_DB[("ML DB")]
-    RD --- RD_DB[("Decision DB")]
-    CM --- CM_DB[("Case DB")]
-    NT --- NT_DB[("Notification DB")]
-    RP --- RP_DB[("Reporting DB")]
+    FA --- FA_DB[("Assessment DB (Mongo)")]
+    PF --- PF_DB[("Payment DB (Mongo)")]
+    ATO --- ATO_DB[("ATO DB (Mongo)")]
+    ML --- ML_DB[("ML DB (Mongo)")]
+    RD --- RD_DB[("Decision DB (SQL)")]
+    CM --- CM_DB[("Case DB (SQL)")]
+    NT --- NT_DB[("Notification DB (Mongo)")]
+    RP --- RP_DB[("Reporting DB (Mongo)")]
 
     classDef sync fill:#EEEDFE,stroke:#534AB7,color:#3C3489
     classDef async fill:#E1F5EE,stroke:#0F6E56,color:#085041
@@ -101,22 +101,25 @@ flowchart LR
 
 ### 3.3 Data ownership
 
-Each service owns its database (MongoDB). **No service reads another service's database**; services share only IDs (e.g. `assessmentId`) and events.
+Each service owns its database. **No service reads another service's database**; services share only IDs (e.g. `assessmentId`) and events.
 
-| Service | Main collections |
-|---|---|
-| Fraud Assessment | `assessments`, `idempotency_records`, `outbox` |
-| Payment Fraud | `payment_rules`, `payment_rule_results`, `velocity_counters` |
-| ATO Detection | `ato_rules`, `ato_rule_results`, `device_profiles`, `login_history` |
-| ML Scoring | `model_registry`, `score_logs` |
-| Risk Decision | `decisions`, `decision_policies`, `outbox` |
-| Case Management | `fraud_cases`, `case_notes`, `inbox` |
-| Notification | `notification_log`, `subscriptions`, `inbox` |
-| Reporting | `read_models`, `inbox` |
+The platform uses **polyglot persistence**: **MongoDB** for flexible, event-shaped data, and **SQL Server** for the two services with structured, relational, workflow-driven data (Risk Decision and Case Management).
+
+| Service | Database | Main collections / tables |
+|---|---|---|
+| Fraud Assessment | MongoDB | `assessments`, `idempotency_records`, `outbox` |
+| Payment Fraud | MongoDB | `payment_rules`, `payment_rule_results`, `velocity_counters` |
+| ATO Detection | MongoDB | `ato_rules`, `ato_rule_results`, `device_profiles`, `login_history` |
+| ML Scoring | MongoDB | `model_registry`, `score_logs` |
+| Risk Decision | **SQL Server** | `Decisions`, `DecisionReasons`, `DecisionPolicies`, `OutboxMessages` |
+| Case Management | **SQL Server** | `FraudCases`, `CaseNotes`, `CaseOutcomes`, `InboxMessages` |
+| Notification | MongoDB | `notification_log`, `subscriptions`, `inbox` |
+| Reporting | MongoDB | `read_models`, `inbox` |
 
 Notes:
 
-- MongoDB multi-document transactions (needed for Outbox/Idempotency) require running MongoDB as a **replica set**, even locally.
+- MongoDB multi-document transactions (needed for Outbox/Idempotency in Assessment) require running MongoDB as a **replica set**, even locally.
+- Risk Decision and Case Management use relational tables with foreign keys **inside their own database only** (e.g. `Decisions` → `DecisionReasons`, `FraudCases` → `CaseNotes`), and SQL transactions for the Outbox/Inbox.
 - Idempotency is enforced with a **unique index** on `(clientId, idempotencyKey)`.
 - Sensitive payment data is stored as **token/hash only**.
 
@@ -344,7 +347,7 @@ Assessment requests require an `Idempotency-Key` header.
 ## 8. Tech stack
 
 - **Services:** ASP.NET Core (.NET LTS), Clean Architecture inside each service
-- **Database:** MongoDB (one database per service, replica set)
+- **Databases:** MongoDB (replica set) for Assessment, Payment Fraud, ATO Detection, ML Scoring, Notification, Reporting; SQL Server for Risk Decision and Case Management (one database per service)
 - **Messaging:** RabbitMQ
 - **ML:** ML.NET or ONNX Runtime, hosted inside the ML Scoring service
 - **Gateway:** YARP (or Ocelot)
@@ -372,7 +375,6 @@ Assessment requests require an `Idempotency-Key` header.
 - Final latency / throughput / availability targets (after load testing).
 - Source and labelling of ML training data (case outcomes, public datasets, or synthetic data).
 - Exact fallback policy per fraud type when ML is unavailable.
-- Whether Risk Decision and Case Management stay on MongoDB or move to a relational store.
 - Notification channels (email, webhook, chat).
 
 ---
