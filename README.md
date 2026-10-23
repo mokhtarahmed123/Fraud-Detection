@@ -69,6 +69,9 @@ flowchart LR
     NT --- NT_DB[("Notification DB (Mongo)")]
     RP --- RP_DB[("Reporting DB (Mongo)")]
 
+    PF --- PF_CACHE[("Redis: velocity counters")]
+    ATO --- ATO_CACHE[("Redis: velocity + device cache")]
+
     classDef sync fill:#EEEDFE,stroke:#534AB7,color:#3C3489
     classDef async fill:#E1F5EE,stroke:#0F6E56,color:#085041
     classDef ext fill:#F1EFE8,stroke:#5F5E5A,color:#444441
@@ -103,13 +106,13 @@ flowchart LR
 
 Each service owns its database. **No service reads another service's database**; services share only IDs (e.g. `assessmentId`) and events.
 
-The platform uses **polyglot persistence**: **MongoDB** for flexible, event-shaped data, and **SQL Server** for the two services with structured, relational, workflow-driven data (Risk Decision and Case Management).
+The platform uses **polyglot persistence**: **MongoDB** for flexible, event-shaped data, **SQL Server** for the two services with structured, relational, workflow-driven data (Risk Decision and Case Management), and **Redis** for fast, short-lived data (velocity counters and hot caches) in Payment Fraud and ATO Detection.
 
-| Service | Database | Main collections / tables |
+| Service | Database | Main collections / tables / keys |
 |---|---|---|
 | Fraud Assessment | MongoDB | `assessments`, `idempotency_records`, `outbox` |
-| Payment Fraud | MongoDB | `payment_rules`, `payment_rule_results`, `velocity_counters` |
-| ATO Detection | MongoDB | `ato_rules`, `ato_rule_results`, `device_profiles`, `login_history` |
+| Payment Fraud | MongoDB + **Redis** | Mongo: `payment_rules`, `payment_rule_results`. Redis: velocity counters (e.g. attempts per card/account/IP per time window) |
+| ATO Detection | MongoDB + **Redis** | Mongo: `ato_rules`, `ato_rule_results`, `device_profiles`, `login_history`. Redis: failed-login counters, recent-device cache |
 | ML Scoring | MongoDB | `model_registry`, `score_logs` |
 | Risk Decision | **SQL Server** | `Decisions`, `DecisionReasons`, `DecisionPolicies`, `OutboxMessages` |
 | Case Management | **SQL Server** | `FraudCases`, `CaseNotes`, `CaseOutcomes`, `InboxMessages` |
@@ -120,6 +123,8 @@ Notes:
 
 - MongoDB multi-document transactions (needed for Outbox/Idempotency in Assessment) require running MongoDB as a **replica set**, even locally.
 - Risk Decision and Case Management use relational tables with foreign keys **inside their own database only** (e.g. `Decisions` → `DecisionReasons`, `FraudCases` → `CaseNotes`), and SQL transactions for the Outbox/Inbox.
+- **Redis usage:** counters use atomic `INCR` with a **TTL** equal to the rule's time window (sliding or fixed window), so old counts expire automatically. Redis holds derived, short-lived data only; the durable record stays in MongoDB.
+- **Redis failure:** if Redis is unavailable, velocity rules fall back to a Mongo query or are skipped, and the decision records that velocity data was unavailable (same idea as the ML fallback in UC-05).
 - Idempotency is enforced with a **unique index** on `(clientId, idempotencyKey)`.
 - Sensitive payment data is stored as **token/hash only**.
 
@@ -129,7 +134,7 @@ Notes:
 - **Transactional Outbox** in Assessment and Decision: a decision is never saved without its event being published eventually.
 - **Inbox** in every consumer + idempotent handlers: RabbitMQ may deliver a message more than once.
 - **Dead-Letter Queues** for messages that keep failing.
-- **Timeout + Fallback** around ML Scoring (see UC-05).
+- **Timeout + Fallback** around ML Scoring (see UC-05) and around Redis lookups.
 - **Versioning:** every decision stores the rule versions, model version, and policy version used.
 
 ### 3.5 Key events
@@ -347,7 +352,7 @@ Assessment requests require an `Idempotency-Key` header.
 ## 8. Tech stack
 
 - **Services:** ASP.NET Core (.NET LTS), Clean Architecture inside each service
-- **Databases:** MongoDB (replica set) for Assessment, Payment Fraud, ATO Detection, ML Scoring, Notification, Reporting; SQL Server for Risk Decision and Case Management (one database per service)
+- **Databases:** MongoDB (replica set) for Assessment, Payment Fraud, ATO Detection, ML Scoring, Notification, Reporting; SQL Server for Risk Decision and Case Management (one database per service); Redis for velocity counters and caches in Payment Fraud and ATO Detection
 - **Messaging:** RabbitMQ
 - **ML:** ML.NET or ONNX Runtime, hosted inside the ML Scoring service
 - **Gateway:** YARP (or Ocelot)
