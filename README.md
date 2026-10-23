@@ -52,10 +52,12 @@ flowchart LR
     FA <--> ML["ML Scoring"]
     FA <--> RD["Risk Decision"]
 
-    RD --> MQ{{"RabbitMQ"}}
-    MQ --> CM["Case Management"]
-    MQ --> NT["Notification"]
-    MQ --> RP["Reporting"]
+    RD --> KF{{"Kafka"}}
+    KF --> CM["Case Management"]
+    KF --> NT["Notification"]
+    KF --> RP["Reporting"]
+    KF --> SP["Stream Processing (PySpark)"]
+    SP --> KF
 
     GW <-->|"Review"| CM
     GW <-->|"Read"| RP
@@ -68,6 +70,7 @@ flowchart LR
     CM --- CM_DB[("Case DB (SQL)")]
     NT --- NT_DB[("Notification DB (Mongo)")]
     RP --- RP_DB[("Reporting DB (Mongo)")]
+    SP --- SP_DB[("Stream features / aggregates (Mongo)")]
 
     PF --- PF_CACHE[("Redis: velocity counters")]
     ATO --- ATO_CACHE[("Redis: velocity + device cache")]
@@ -76,11 +79,13 @@ flowchart LR
     classDef async fill:#E1F5EE,stroke:#0F6E56,color:#085041
     classDef ext fill:#F1EFE8,stroke:#5F5E5A,color:#444441
     class GW,FA,PF,ATO,ML,RD sync
-    class MQ,CM,NT,RP async
+    class KF,CM,NT,RP,SP async
     class EXT,DASH ext
 ```
 
-**Purple = synchronous (REST) path. Teal = asynchronous (RabbitMQ) path.**
+**Purple = synchronous (REST) path. Teal = asynchronous (Kafka) path.**
+
+The decision is always returned on the synchronous path. Kafka and Stream Processing work **after** the decision and never sit on the response path.
 
 ### 3.1 Services
 
@@ -95,11 +100,13 @@ flowchart LR
 | **Case Management** | Creates and manages cases for analyst review; records outcomes. |
 | **Notification** | Sends alerts to analysts and systems. |
 | **Reporting** | Builds read models and KPIs for the dashboard. |
+| **Stream Processing (PySpark)** | Consumes the Kafka event stream with Spark Structured Streaming (windows, watermarks); computes aggregates and behavioural features (e.g. transactions per user in the last 5 minutes), detects patterns across events, publishes alerts back to Kafka, and stores features/aggregates for dashboards and ML training. Runs **near-real-time (seconds)**, not on the response path. |
 
 ### 3.2 Communication rules
 
 - **REST (synchronous):** used when the caller needs the result before it can respond: Gateway → Assessment → Payment / ATO / ML / Decision.
-- **RabbitMQ (asynchronous):** used for work that may happen after the response: cases, alerts, reports.
+- **Kafka (asynchronous):** the event backbone for work that happens after the response: cases, alerts, reports, and stream processing. Events are retained in topics, so they can be **replayed** (re-evaluation, backfills, ML training).
+- **Latency split:** instant counters (Redis) serve the synchronous rules; heavier windowed aggregations (Spark) feed dashboards, alerts, and ML features with a delay of seconds.
 - The platform never waits for an email, a case, or a report before returning the decision.
 
 ### 3.3 Data ownership
@@ -118,6 +125,7 @@ The platform uses **polyglot persistence**: **MongoDB** for flexible, event-shap
 | Case Management | **SQL Server** | `FraudCases`, `CaseNotes`, `CaseOutcomes`, `InboxMessages` |
 | Notification | MongoDB | `notification_log`, `subscriptions`, `inbox` |
 | Reporting | MongoDB | `read_models`, `inbox` |
+| Stream Processing | MongoDB | `stream_features`, `window_aggregates`, `stream_alerts` (plus Spark checkpoints) |
 
 Notes:
 
@@ -132,8 +140,9 @@ Notes:
 
 - **Idempotency key** on assessment requests: the same request twice returns the same response.
 - **Transactional Outbox** in Assessment and Decision: a decision is never saved without its event being published eventually.
-- **Inbox** in every consumer + idempotent handlers: RabbitMQ may deliver a message more than once.
-- **Dead-Letter Queues** for messages that keep failing.
+- **Inbox** in every consumer + idempotent handlers: Kafka delivers at-least-once, so a message may be processed more than once.
+- **Dead-letter topics** (e.g. `<topic>.dlq`) for messages that keep failing after retries; Kafka has no built-in DLQ, so consumers publish failures there.
+- **Message keys and ordering:** events are keyed (e.g. by `accountId` / `userId`) so events of the same entity stay ordered within a partition.
 - **Timeout + Fallback** around ML Scoring (see UC-05) and around Redis lookups.
 - **Versioning:** every decision stores the rule versions, model version, and policy version used.
 
@@ -147,6 +156,9 @@ Notes:
 | `RuleSetChanged` | Payment Fraud / ATO Detection | Reporting (audit) |
 | `PolicyChanged` | Risk Decision | Reporting (audit) |
 | `ModelActivated` | ML Scoring | Reporting (audit) |
+| `StreamAlertRaised` | Stream Processing | Case Management, Notification, Reporting |
+
+Events are published to Kafka topics (e.g. `fraud.assessments.completed`, `fraud.cases`, `fraud.alerts`, `fraud.config.changes`).
 
 ---
 
@@ -177,7 +189,7 @@ The numbers are **initial targets** for the graduation project and should be rev
 | Throughput | ~100 events/s at peak | Scale each service independently |
 | Availability | 99.5% for assessment | Multiple instances, health checks |
 | Resilience | Platform still decides if ML is down | Timeout + fallback policy |
-| Consistency | No lost events | Outbox, Inbox, DLQ |
+| Consistency | No lost events | Outbox, Inbox, dead-letter topics |
 | Idempotency | Same request → same response | Idempotency key |
 | Security | Authenticated clients, role-based dashboard | Gateway, OAuth2 / JWT, RBAC |
 | Data protection | No raw card data | Tokenization / hashing |
@@ -306,7 +318,7 @@ The numbers are **initial targets** for the graduation project and should be rev
 - **Actor:** Fraud Analyst
 - **Trigger:** `FraudCaseOpened` / high-risk `FraudAssessmentCompleted`.
 - **Main flow:** Notification consumes the event and sends the alert through the configured channel, then records delivery status.
-- **Alternative flows:** delivery fails → retry, then dead-letter queue.
+- **Alternative flows:** delivery fails → retry, then dead-letter topic.
 
 ### UC-14: Query an assessment
 
@@ -353,8 +365,9 @@ Assessment requests require an `Idempotency-Key` header.
 
 - **Services:** ASP.NET Core (.NET LTS), Clean Architecture inside each service
 - **Databases:** MongoDB (replica set) for Assessment, Payment Fraud, ATO Detection, ML Scoring, Notification, Reporting; SQL Server for Risk Decision and Case Management (one database per service); Redis for velocity counters and caches in Payment Fraud and ATO Detection
-- **Messaging:** RabbitMQ
-- **ML:** ML.NET or ONNX Runtime, hosted inside the ML Scoring service
+- **Messaging:** Apache Kafka (producers/consumers with Confluent.Kafka in .NET)
+- **Stream processing:** PySpark (Spark Structured Streaming) reading from and writing to Kafka, storing results in MongoDB
+- **ML:** ML.NET or ONNX Runtime, hosted inside the ML Scoring service. Models can be trained in Python (e.g. XGBoost) and exported to ONNX for inference in .NET.
 - **Gateway:** YARP (or Ocelot)
 - **Auth:** OAuth2 / JWT
 - **Containers:** Docker, Docker Compose
@@ -369,10 +382,11 @@ Assessment requests require an `Idempotency-Key` header.
 | 1 | Domain model, event contracts, API contracts |
 | 2 | Gateway + Fraud Assessment + idempotency + Payment Fraud (rules) + Risk Decision |
 | 3 | ATO Detection (rules, device profile, login history) |
-| 4 | RabbitMQ, Outbox/Inbox, Case Management, Notification |
-| 5 | ML Scoring + fallback policy |
-| 6 | Reporting + Dashboard |
-| 7 | Load testing, resilience tests, security review |
+| 4 | Kafka (topics, producers, consumers), Outbox/Inbox, dead-letter topics, Case Management, Notification |
+| 5 | Stream Processing: PySpark Structured Streaming (windows, watermarks) reading Kafka, writing to MongoDB |
+| 6 | ML Scoring + fallback policy (train in Python, serve via ONNX / ML.NET) |
+| 7 | Reporting + Dashboard |
+| 8 | Data simulator for fraud scenarios (velocity, takeover, impossible travel), load testing, resilience tests, security review |
 | Later | Bot Detection, Identity / New-Account Fraud |
 
 ## 10. Open decisions
@@ -381,14 +395,15 @@ Assessment requests require an `Idempotency-Key` header.
 - Source and labelling of ML training data (case outcomes, public datasets, or synthetic data).
 - Exact fallback policy per fraud type when ML is unavailable.
 - Notification channels (email, webhook, chat).
+- Number of Kafka partitions per topic and the retention period (depends on expected volume and replay needs).
 
 ---
 
 ## 11. Testing strategy
 
 - **Unit tests:** rules, policy combination logic, idempotency behaviour.
-- **Integration tests:** API + database + RabbitMQ per service.
-- **Resilience tests:** ML timeout, broker down, database down, duplicate delivery.
+- **Integration tests:** API + database + Kafka per service; Spark jobs against a test Kafka topic.
+- **Resilience tests:** ML timeout, Kafka down, Redis down, database down, duplicate delivery, consumer restart and replay.
 - **Performance tests:** p95/p99 latency and throughput on the synchronous path.
 - **Security tests:** role separation (analyst vs admin), client scopes.
 - **Detection quality:** precision, recall, and false-positive rate; guard against data leakage (only use data available at decision time).
