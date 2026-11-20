@@ -1,0 +1,22 @@
+# .NET
+**/bin/
+**/obj/
+
+# Logs
+**/Logs/
+*.log
+
+# Secrets
+.env
+.env.*
+!.env.example
+secrets.json
+**/appsettings.Development.json
+**/appsettings.Development.yml
+**/appsettings.Production.json
+**/appsettings.Production.yml
+
+# Visual Studio
+.vs/
+*.user
+*.suo
